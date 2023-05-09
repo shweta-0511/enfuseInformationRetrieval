@@ -1,0 +1,290 @@
+pip install transformers
+'''Importing required libraries and downloading necessary modules'''
+import torch
+from bs4 import BeautifulSoup
+import requests
+import pandas as pd
+import string
+import numpy as np
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.corpus import wordnet
+from nltk.stem import WordNetLemmatizer
+import pandas as pd
+import math
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import BertTokenizer, BertForQuestionAnswering
+import sys
+pd.set_option('display.max_colwidth', None)
+
+nltk.download('stopwords')
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('wordnet')
+nltk.download('averaged_perceptron_tagger')
+'''creating instance for  pre-trained BERT model fine-tuned on the Stanford Question Answering Dataset (SQuAD) 
+for question answering process  '''
+model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+'''creating instance for BertTokenizer which is used to convert input text into tokens 
+that the BERT model can process.'''
+tokenizer = BertTokenizer.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+
+'''function to read data from wikipedia URL one-by-one and writing in one single dataframe'''
+def read_wikipedia(file_path):
+    """Scraping text data from the webpages given in url_list file"""
+    df_final=pd.DataFrame()  
+    doc_id=1 
+    # get URL
+    with open(file_path, "r") as url_list: 
+        for url in url_list:
+            url=url.strip()
+            page = requests.get(url)    
+            # scrape webpage
+            soup = BeautifulSoup(page.content, 'html.parser') 
+            '''Reading only paragraphs from the wikipedia pages'''
+            p_tags=soup.find_all("p")
+            li_tags=soup.find_all("li")
+            p_lines= [p.get_text() for p in p_tags]
+            li_lines =[l.get_text() for l in li_tags]
+            lines=[]
+            app1 = [line for line in p_lines if (line!='\n' and line!='')]
+            app2= [line for line in li_lines if (line!='\n' and line!='')]
+            lines=app1+app2
+            df=pd.DataFrame(lines,columns=['paragraph'])    
+            df['paragraph']=df['paragraph'].str.replace(r"\[\d+\]*",'',regex=True)
+            '''doc_id created to identify different wikipedia pages read'''
+            df['doc_id'] = doc_id
+            doc_name=url.split("/")[-1]
+            '''document_name created to store the name of wikipedia page'''
+            df['document_name']=doc_name
+            doc_id+=1       
+            df['paragraph_breakdown']=df['paragraph'].apply(lambda x: len(x.split()))
+            df=df[df['paragraph_breakdown'] > 80]
+            '''Paragraph_id created to uniquely identify paragraphs from the page'''
+            df['paragraph_id'] = np.arange(len(df))
+            df_final = pd.concat([df_final, df])
+            
+    '''creating final dataframe to write the data fetched from wikedia pages'''
+    df_final = df_final[['doc_id','document_name','paragraph_id','paragraph']]    
+    return df_final
+    
+    '''function to remove stop words from a sentence'''
+def remove_stop_words(sentence):
+    # Tokenize the sentence into words
+    words = word_tokenize(sentence)
+    
+    # Remove stop words from the sentence
+    stop_words = set(stopwords.words('english'))
+    filtered_words = [word for word in words if word.lower() not in stop_words]
+    
+    # Join the filtered words back into a sentence
+    filtered_sentence = ' '.join(filtered_words)
+    return filtered_sentence
+    
+    '''function to lemmatize a sentence'''
+def lemmatize_sentence(sentence):
+    # Initialize the lemmatizer
+    lemmatizer = WordNetLemmatizer()
+    # Tokenize the sentence into words
+    words = nltk.word_tokenize(sentence)
+    
+    # Lemmatize each word using its part of speech tag
+    lemmas = []
+    for word, tag in nltk.pos_tag(words):
+        pos = get_wordnet_pos(tag)
+        lemma = lemmatizer.lemmatize(word, pos=pos)
+        lemmas.append(lemma)
+        
+    # Join the lemmatized words back into a sentence
+    lemmatized_sentence = ' '.join(lemmas)
+    return lemmatized_sentence
+
+'''function to map the part of speech tags returned by nltk.pos_tag to the WordNet part of speech categories'''
+def get_wordnet_pos(treebank_tag):
+    if treebank_tag.startswith('J'):
+        return wordnet.ADJ
+    elif treebank_tag.startswith('V'):
+        return wordnet.VERB
+    elif treebank_tag.startswith('N'):
+        return wordnet.NOUN
+    elif treebank_tag.startswith('R'):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN  # default to noun if the tag is not recognized
+
+
+'''function to pre-process the dataframe'''
+def pre_processing(df,column):
+    df['pre_processed_text']=df[column].str.replace(r"\[\d+\]*",'',regex=True)      
+    df['pre_processed_text'] = df['pre_processed_text'].apply(remove_stop_words)
+    df['pre_processed_text']=df['pre_processed_text'].str.replace(r'[^\w\s]+','',regex=True).str.lower() 
+    df['pre_processed_text'] = df['pre_processed_text'].apply(lambda x: lemmatize_sentence(x))
+    #df=df[['doc_id','document_name','paragraph_id','description','pre_processed_desc']]   
+    return df
+
+def segment_documents(df, max_doc_length=450):
+    """ Create a new DataFrame to store segmented documents; this will help in pulling the specific keywords which made the 
+    specific line to be suitable for a query"""    
+    segmented_docs = pd.DataFrame(columns=['doc_id', 'document_name', 'paragraph_id', 'paragraph', 'document'])
+
+    # Iterate over each row in the input DataFrame
+    for index, row in df.iterrows():
+        doc_id = row['doc_id']
+        document_name = row['document_name']
+        paragraph_id = row['paragraph_id']
+        doc = row['paragraph']
+        lemmatize = row['pre_processed_text']
+        # Split document by spaces to obtain a word count that roughly approximates the token count
+        split_to_words = lemmatize.split(" ")
+
+        # If the document is longer than our maximum length, split it up into smaller segments and add them to the new DataFrame
+        if len(split_to_words) > max_doc_length:
+            for doc_segment in range(0, len(split_to_words), max_doc_length):
+                segmented_docs = pd.concat([segmented_docs, pd.DataFrame({'doc_id': [doc_id], 'document_name': [document_name], 'paragraph_id': [paragraph_id], 'paragraph': [doc] ,'document': [" ".join(split_to_words[doc_segment:doc_segment + max_doc_length])]})])
+
+        # If the document is shorter than our maximum length, add it to the new DataFrame
+        else:
+            segmented_docs = pd.concat([segmented_docs, pd.DataFrame({'doc_id': [doc_id], 'document_name': [document_name], 'paragraph_id': [paragraph_id], 'paragraph': [doc] ,'document': [lemmatize]})])
+
+    return segmented_docs.reset_index(drop=True)
+def get_top_k_articles(query, docs_df, ans_column, k=5):
+    # Remove stop words from the query and lemmatize it
+    filtered_query = remove_stop_words(query)
+    lemmatized_query = lemmatize_sentence(filtered_query)
+
+    # Initialize a vectorizer that uses the preprocessed document text
+    vectorizer = TfidfVectorizer(analyzer="word")
+
+    # Create a corpus of query and documents and convert to TFIDF vectors
+    query_and_docs = [lemmatized_query] + list(docs_df[ans_column])    
+    matrix = vectorizer.fit_transform(query_and_docs)
+
+    # Holds our cosine similarity scores
+    scores = []
+
+    # The first vector is our query text, so compute the similarity of our query against all document vectors
+    for i in range(1, len(query_and_docs)):
+        score = cosine_similarity(matrix[0], matrix[i])[0][0]
+        scores.append(score)
+
+    # Check if all scores are 0 and return an empty dataframe if so
+    if all(score ==0 for score in scores):
+        return pd.DataFrame(columns=['doc_id', 'document_name', 'paragraph_id', 'paragraph', 'document'])
+
+    # Sort list of scores and return the top k highest scoring documents
+    sorted_list = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    top_doc_indices = [x[0] for x in sorted_list[:k]]
+    top_docs = docs_df.iloc[top_doc_indices]
+  
+    return top_docs.reset_index(drop=True)
+
+def bert_answer(question, candidate, query_id, display= False):
+    query = question.replace("?",'')
+    filtered_query = remove_stop_words(query)
+    lemmatized_query = lemmatize_sentence(filtered_query)
+    
+    # Initialize variables for best answer and document information
+    max_score = float('-inf')
+    best_answer = ""
+    doc_id = ""
+    document_name = ""
+    paragraph_id = ""
+    paragraph = ""
+    
+    # Loop through the candidate documents and find the one with the highest score
+    for _, row in candidate.iterrows():
+        # Tokenize the question and document
+        inputs = tokenizer(lemmatized_query, row["document"], add_special_tokens=True, return_tensors="pt")
+        input_ids = inputs["input_ids"].tolist()[0]
+        token_type_ids = [0] * len(input_ids)
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        start_scores, end_scores = model(**inputs).start_logits, model(**inputs).end_logits
+        start_index = torch.argmax(start_scores)
+        end_index = torch.argmax(end_scores) + 1
+        answer_tokens = tokens[start_index:end_index]
+        answer_tokens = tokenizer.convert_tokens_to_string(answer_tokens)
+        score = start_scores[0][start_index] + end_scores[0][start_index]
+        if score > max_score:
+            max_score = score
+            best_answer = answer_tokens
+            doc_id = row["doc_id"]
+            document_name = row["document_name"]
+            paragraph_id = row["paragraph_id"]
+            paragraph = row["paragraph"]
+    if display:
+        promptDf = pd.DataFrame({'doc_id': [doc_id], 'document_name': [document_name], 'query_id': [query_id], 'query': [question], 'paragraph_id': [paragraph_id], 'answer': [paragraph], 'keyword' : [best_answer], 'bert_score': [max_score.detach().numpy()]}) 
+        return promptDf
+    else:
+        storeDf = pd.DataFrame({'doc_id': [doc_id], 'document_name': [document_name], 'query_id': [query_id], 'query': [question], 'paragraph_id': [paragraph_id], 'answer': [paragraph], 'keyword' : [best_answer], 'bert_score': [max_score.detach().numpy()]}) 
+        return storeDf
+        
+ def result(query_df, segmented_docs):
+    resultDf = pd.DataFrame(columns=['doc_id', 'document_name', 'query_id', 'query', 'paragraph_id', 'answer', 'keyword', 'bert_score'])
+    # Loop through each query
+    for index, row in query_df.iterrows():
+        query = row['query']
+        query_id = row['query_id']
+    
+        print("Processing answer for query " + str(int(query_id))+": "+ query)
+        # Segment our documents
+        # Retrieve the top k most relevant documents to the query
+        candidate_docs = get_top_k_articles(query, segmented_docs, 'document', 5)
+        if candidate_docs.empty:
+            new_row = pd.DataFrame({'doc_id': '', 'document_name': '',  'query_id' : [query_id], 'query': [query],'paragraph_id': '', 'answer': "No answer.", 'keyword' : '', 'bert_score': 0})
+            new_row.reset_index(drop=True, inplace=True)
+            resultDf = pd.concat([resultDf,new_row])
+            continue
+        # Return the likeliest answers from each of our top k most relevant documents in descending order
+        result_df = bert_answer(query, candidate_docs, query_id)
+        resultDf = pd.concat([resultDf, result_df]).reset_index(drop=True)
+    return resultDf
+
+def main():
+    soup_list=[]
+    '''reading input file having list of wikipedia pages URL to fetch data from'''
+    file_path='url_lists.txt'
+    df=read_wikipedia(file_path)
+
+    df=pre_processing(df,'paragraph')
+    segmented_docs = segment_documents(df, 450)
+    
+    query_df = pd.read_csv('Annotated_queries.csv', encoding='iso-8859-1')
+    print("Approach 1")
+    resultDf = result(query_df, segmented_docs)
+    resultDf.to_csv('enfuse_answer.csv',index=False)
+    
+ def prompt():
+    soup_list=[]
+    '''reading input file having list of wikipedia pages URL to fetch data from'''
+    file_path='url_lists.txt'
+    df=read_wikipedia(file_path)
+
+    df=pre_processing(df,'paragraph')
+    segmented_docs = segment_documents(df, 450)
+    i=0
+    print("Welcome to the QA system!")
+    while True:
+        # Prompt for user input
+        question = input("What's your question? (Press q to quit) ")
+        if question.lower() == 'q':
+            break
+        i = i+1
+        print("Processing answer for query: " +question)
+        print("-------------------------------------------------")            
+        # Get the answer and display it
+        candidate_docs = get_top_k_articles(question, segmented_docs,  'document',  5)
+        if candidate_docs.empty:
+            print(question+" "+"No answer")
+            continue
+        # Return the likeliest answers from each of our top k most relevant docments in descending order
+        final_answer = bert_answer(question, candidate_docs, i, display=True)
+        print("Most relevant answer for the question")
+        print("-----------------------DOCUMENT NAME--------------------------")
+        print(final_answer['document_name'].to_string(index=False))
+        print("-----------------------MATCHED KEYWORDS--------------------------")
+        print(final_answer['keyword'].to_string(index=False))
+        print("-----------------------PARAGRAPH--------------------------")
+        print( final_answer['answer'].to_string(index=False))
+    print("Thanks for using the QA system!")
